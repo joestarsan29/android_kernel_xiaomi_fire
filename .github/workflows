@@ -11,5 +11,5 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - - name: Verify workflow
+      - name: Verify workflow
         run: echo "Workflow running properly!"
