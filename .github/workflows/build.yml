@@ -1,8 +1,26 @@
-make O=out ARCH=arm64 fire_defconfig
+name: Build Kernel
 
-make -j$(nproc) \
-O=out \
-ARCH=arm64 \
-CC=clang \
-LLVM=1 \
-LLVM_IAS=1
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build kernel
+        run: |
+          uname -a
+          clang --version || true
+
+          make O=out ARCH=arm64 fire_defconfig
+
+          make -j$(nproc) \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1
