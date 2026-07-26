@@ -5,11 +5,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Verify workflow
-        run: echo "Workflow running properly!"
+      - name: Show system info
+        run: |
+          uname -a
+          clang --version || true
