@@ -1,17 +1,8 @@
-name: Build Kernel
+make O=out ARCH=arm64 fire_defconfig
 
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Show system info
-        run: |
-          uname -a
-          clang --version || true
+make -j$(nproc) \
+O=out \
+ARCH=arm64 \
+CC=clang \
+LLVM=1 \
+LLVM_IAS=1
