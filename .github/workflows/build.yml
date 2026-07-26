@@ -11,10 +11,26 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git \
+            make \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            dwarves \
+            ccache
+
       - name: Build kernel
         run: |
           uname -a
+          gcc --version || true
           clang --version || true
+          make --version
 
           make O=out ARCH=arm64 fire_defconfig
 
