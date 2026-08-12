@@ -1203,6 +1203,15 @@ const char * const vmstat_text[] = {
 	"pgscan_kswapd",
 	"pgscan_direct",
 	"pgscan_direct_throttle",
+	"lru_kswapd_no_progress",
+	"lru_kswapd_anon",
+	"lru_kswapd_file",
+	"lru_direct_anon",
+	"lru_direct_file",
+	"lru_kswapd_swap_full",
+	"lru_direct_swap_full",
+	"lru_no_gfp_io",
+	"lru_no_writepage",
 
 #ifdef CONFIG_NUMA
 	"zone_reclaim_failed",
@@ -1900,7 +1909,7 @@ static void vmstat_shepherd(struct work_struct *w)
 	}
 	put_online_cpus();
 
-	schedule_delayed_work(&shepherd,
+	queue_delayed_work(system_power_efficient_wq, &shepherd,
 		round_jiffies_relative(sysctl_stat_interval));
 }
 
@@ -1912,7 +1921,7 @@ static void __init start_shepherd_timer(void)
 		INIT_DEFERRABLE_WORK(per_cpu_ptr(&vmstat_work, cpu),
 			vmstat_update);
 
-	schedule_delayed_work(&shepherd,
+	queue_delayed_work(system_power_efficient_wq, &shepherd,
 		round_jiffies_relative(sysctl_stat_interval));
 }
 
