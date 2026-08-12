@@ -10,15 +10,22 @@
 #include <hwmsensor.h>
 #include <SCP_sensorHub.h>
 #include "SCP_power_monitor.h"
+#include <linux/jiffies.h>
 #include <linux/pm_wakeup.h>
+#include <linux/workqueue.h>
 #include "tpd_notify.h"
 
 
 
 #define ALSPSHUB_DEV_NAME     "alsps_hub_pl"
+#define FIRE_PS_THD_VAL_HIGH  18
+#define FIRE_PS_THD_VAL_LOW   12
+#define FIRE_PS_FAR_DEBOUNCE_MS 2500
+#define FIRE_PS_NEAR_MAX_VALUE 0
 
 struct alspshub_ipi_data {
 	struct work_struct init_done_work;
+	struct delayed_work ps_far_work;
 	atomic_t first_ready_after_boot;
 	/*misc */
 	atomic_t	als_suspend;
@@ -41,6 +48,13 @@ struct alspshub_ipi_data {
 	bool als_android_enable;
 	bool ps_android_enable;
 	struct wakeup_source *ps_wake_lock;
+	spinlock_t ps_debounce_lock;
+	bool ps_reported_valid;
+	bool ps_pending_valid;
+	int ps_reported_value;
+	int ps_pending_value;
+	int ps_pending_status;
+	int64_t ps_pending_time_stamp;
 
 	/* The backlight level notifier block */
 	struct notifier_block backlight_nb;
@@ -83,6 +97,128 @@ enum {
 
 extern int backlight_level_register_notifier(struct notifier_block *nb);
 extern int backlight_level_unregister_notifier(struct notifier_block *nb);
+
+static int alspshub_push_ps_threshold(struct alspshub_ipi_data *obj,
+	const char *reason)
+{
+	int err;
+	int32_t cfg_data[2] = {0};
+
+	if (!obj)
+		return -EINVAL;
+
+	spin_lock(&calibration_lock);
+	cfg_data[0] = atomic_read(&obj->ps_thd_val_high);
+	cfg_data[1] = atomic_read(&obj->ps_thd_val_low);
+	spin_unlock(&calibration_lock);
+
+	err = sensor_cfg_to_hub(ID_PROXIMITY,
+		(uint8_t *)cfg_data, sizeof(cfg_data));
+	if (err < 0)
+		pr_err("%s: sensor_cfg_to_hub ps fail\n", reason);
+	else
+		pr_debug("%s: ps threshold high=%d low=%d\n",
+			reason, cfg_data[0], cfg_data[1]);
+
+	return err;
+}
+
+static bool alspshub_ps_is_near(int value)
+{
+	return value <= FIRE_PS_NEAR_MAX_VALUE;
+}
+
+static int alspshub_report_ps_now(struct alspshub_ipi_data *obj,
+	int value, int status, int64_t time_stamp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&obj->ps_debounce_lock, flags);
+	obj->ps_reported_valid = true;
+	obj->ps_reported_value = value;
+	obj->ps_pending_valid = false;
+	spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+
+	return ps_data_report_t(value, status, time_stamp);
+}
+
+static void alspshub_ps_far_work(struct work_struct *work)
+{
+	struct alspshub_ipi_data *obj = container_of(to_delayed_work(work),
+		struct alspshub_ipi_data, ps_far_work);
+	int value, status;
+	int64_t time_stamp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&obj->ps_debounce_lock, flags);
+	if (!obj->ps_pending_valid) {
+		spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+		return;
+	}
+
+	value = obj->ps_pending_value;
+	status = obj->ps_pending_status;
+	time_stamp = obj->ps_pending_time_stamp;
+	obj->ps_pending_valid = false;
+	obj->ps_reported_valid = true;
+	obj->ps_reported_value = value;
+	spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+
+	__pm_wakeup_event(obj->ps_wake_lock, msecs_to_jiffies(100));
+	ps_data_report_t(value, status, time_stamp);
+}
+
+static int alspshub_report_ps_debounced(struct alspshub_ipi_data *obj,
+	int value, int status, int64_t time_stamp)
+{
+	bool delay_far;
+	unsigned long flags;
+
+	spin_lock_irqsave(&obj->ps_debounce_lock, flags);
+	if (obj->ps_reported_valid && obj->ps_reported_value == value) {
+		obj->ps_pending_valid = false;
+		spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+		cancel_delayed_work(&obj->ps_far_work);
+		return 0;
+	}
+
+	delay_far = obj->ps_reported_valid && !alspshub_ps_is_near(value);
+	if (!delay_far) {
+		obj->ps_pending_valid = false;
+		spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+		cancel_delayed_work(&obj->ps_far_work);
+		return alspshub_report_ps_now(obj, value, status, time_stamp);
+	}
+
+	obj->ps_pending_valid = true;
+	obj->ps_pending_value = value;
+	obj->ps_pending_status = status;
+	obj->ps_pending_time_stamp = time_stamp;
+	spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+
+	mod_delayed_work(system_wq, &obj->ps_far_work,
+		msecs_to_jiffies(FIRE_PS_FAR_DEBOUNCE_MS));
+	return 0;
+}
+
+static void alspshub_reset_ps_debounce(struct alspshub_ipi_data *obj)
+{
+	unsigned long flags;
+
+	if (!obj)
+		return;
+
+	cancel_delayed_work_sync(&obj->ps_far_work);
+
+	spin_lock_irqsave(&obj->ps_debounce_lock, flags);
+	obj->ps_reported_valid = false;
+	obj->ps_pending_valid = false;
+	obj->ps_reported_value = 0;
+	obj->ps_pending_value = 0;
+	obj->ps_pending_status = 0;
+	obj->ps_pending_time_stamp = 0;
+	spin_unlock_irqrestore(&obj->ps_debounce_lock, flags);
+}
 
 long alspshub_read_ps(u8 *ps)
 {
@@ -306,14 +442,7 @@ static void alspshub_init_done_work(struct work_struct *work)
 		pr_err("sensor_set_cmd_to_hub fail,(ID: %d),(action: %d)\n",
 			ID_PROXIMITY, CUST_ACTION_SET_CALI);
 #else
-	/*spin_lock(&calibration_lock);
-	cfg_data[0] = atomic_read(&obj->ps_thd_val_high);
-	cfg_data[1] = atomic_read(&obj->ps_thd_val_low);
-	spin_unlock(&calibration_lock);
-	err = sensor_cfg_to_hub(ID_PROXIMITY,
-		(uint8_t *)cfg_data, sizeof(cfg_data));
-	if (err < 0)
-		pr_err("sensor_cfg_to_hub ps fail\n");*/
+	alspshub_push_ps_threshold(obj, __func__);
 
 	spin_lock(&calibration_lock);
 	cfg_data[0] = atomic_read(&obj->als_cali);
@@ -337,7 +466,8 @@ static int ps_recv_data(struct data_unit_t *event, void *reserved)
 	else if (event->flush_action == DATA_ACTION &&
 			READ_ONCE(obj->ps_android_enable) == true) {
 		__pm_wakeup_event(obj->ps_wake_lock, msecs_to_jiffies(100));
-		err = ps_data_report_t(event->proximity_t.oneshot,
+		err = alspshub_report_ps_debounced(obj,
+			event->proximity_t.oneshot,
 			SENSOR_STATUS_ACCURACY_HIGH,
 			(int64_t)event->time_stamp);
 	} else if (event->flush_action == CALI_ACTION) {
@@ -828,10 +958,16 @@ static int ps_enable_nodata(int en)
 	struct alspshub_ipi_data *obj = obj_ipi_data;
 
 	pr_debug("obj_ipi_data als enable value = %d\n", en);
-	if (en == true)
+	if (en == true) {
 		WRITE_ONCE(obj->ps_android_enable, true);
-	else
+		alspshub_reset_ps_debounce(obj);
+	} else {
 		WRITE_ONCE(obj->ps_android_enable, false);
+		alspshub_reset_ps_debounce(obj);
+	}
+
+	if (en == true)
+		alspshub_push_ps_threshold(obj, __func__);
 
 	res = sensor_enable_to_hub(ID_PROXIMITY, en);
 	if (res < 0) {
@@ -1017,6 +1153,8 @@ static int alspshub_probe(struct platform_device *pdev)
 	obj_ipi_data = obj;
 
 	INIT_WORK(&obj->init_done_work, alspshub_init_done_work);
+	INIT_DELAYED_WORK(&obj->ps_far_work, alspshub_ps_far_work);
+	spin_lock_init(&obj->ps_debounce_lock);
 
 	platform_set_drvdata(pdev, obj);
 
@@ -1028,8 +1166,8 @@ static int alspshub_probe(struct platform_device *pdev)
 	obj->enable = 0;
 	obj->pending_intr = 0;
 	obj->ps_cali = 0;
-	atomic_set(&obj->ps_thd_val_low, 21);
-	atomic_set(&obj->ps_thd_val_high, 28);
+	atomic_set(&obj->ps_thd_val_low, FIRE_PS_THD_VAL_LOW);
+	atomic_set(&obj->ps_thd_val_high, FIRE_PS_THD_VAL_HIGH);
 	WRITE_ONCE(obj->als_factory_enable, false);
 	WRITE_ONCE(obj->als_android_enable, false);
 	WRITE_ONCE(obj->ps_factory_enable, false);
@@ -1154,8 +1292,10 @@ static int alspshub_remove(struct platform_device *pdev)
 			alspshub_init_info.platform_diver_addr;
 	struct alspshub_ipi_data *obj = obj_ipi_data;
 
-	if (obj)
+	if (obj) {
+		alspshub_reset_ps_debounce(obj);
 		wakeup_source_unregister(obj->ps_wake_lock);
+	}
 	err = alspshub_delete_attr(&paddr->driver);
 	if (err)
 		pr_err("alspshub_delete_attr fail: %d\n", err);

@@ -384,6 +384,8 @@ static void f2fs_write_end_io(struct bio *bio)
 
 		f2fs_bug_on(sbi, page->mapping == NODE_MAPPING(sbi) &&
 					page->index != nid_of_node(page));
+		if (f2fs_in_warm_node_list(sbi, page))
+			f2fs_del_fsync_node_entry(sbi, page);
 
 		dec_page_count(sbi, type);
 
@@ -395,8 +397,6 @@ static void f2fs_write_end_io(struct bio *bio)
 				wq_has_sleeper(&sbi->cp_wait))
 			wake_up(&sbi->cp_wait);
 
-		if (f2fs_in_warm_node_list(sbi, page))
-			f2fs_del_fsync_node_entry(sbi, page);
 		clear_cold_data(page);
 		end_page_writeback(page);
 	}
@@ -1514,8 +1514,10 @@ int f2fs_preallocate_blocks(struct kiocb *iocb, struct iov_iter *from)
 map_blocks:
 	err = f2fs_map_blocks(inode, &map, 1, flag);
 	if (map.m_len > 0 && err == -ENOSPC) {
-		if (!direct_io)
-			set_inode_flag(inode, FI_NO_PREALLOC);
+		/*
+		 * If we have allocated some blocks, we should not set
+		 * FI_NO_PREALLOC, because it can be allocated again.
+		 */
 		err = 0;
 	}
 	return err;
